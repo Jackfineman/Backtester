@@ -35,26 +35,56 @@
     <h1 class="text-center">Hyperliquid Vault CAGR Calculator</h1>
     <p class="text-center text-muted">Time-weighted return, stripping out deposits/withdrawals.</p>
 
-    <div class="controls">
-        <div>
-            <label class="form-label">Vault address</label>
-            <input id="vault-address" class="form-control" value="0xdfc24b077bc1425ad1dea75bcb6f8158e10df303">
+    <ul class="nav nav-tabs justify-content-center" id="source-tabs">
+        <li class="nav-item"><button class="nav-link active" data-source="api">Live API</button></li>
+        <li class="nav-item"><button class="nav-link" data-source="csv">Paste daily CSV</button></li>
+    </ul>
+
+    <div id="source-api" class="source-pane">
+        <div class="controls mt-3">
+            <div>
+                <label class="form-label">Vault address</label>
+                <input id="vault-address" class="form-control" value="0xdfc24b077bc1425ad1dea75bcb6f8158e10df303">
+            </div>
+            <div>
+                <label class="form-label">Timeframe (API bucket)</label>
+                <select id="timeframe" class="form-select">
+                    <option value="day">Day (~30 min bars, last 24h)</option>
+                    <option value="week">Week (~4 h bars, last 7d)</option>
+                    <option value="month">Month (~1 day bars, last 30d)</option>
+                    <option value="allTime" selected>All time (coarse, since inception)</option>
+                    <option value="perpDay">Perp day</option>
+                    <option value="perpWeek">Perp week</option>
+                    <option value="perpMonth">Perp month</option>
+                    <option value="perpAllTime">Perp all time</option>
+                </select>
+            </div>
+            <div style="flex: 0 0 auto;">
+                <button id="load" class="btn btn-primary">Load</button>
+            </div>
         </div>
-        <div>
-            <label class="form-label">Timeframe (API bucket)</label>
-            <select id="timeframe" class="form-select">
-                <option value="day">Day</option>
-                <option value="week">Week</option>
-                <option value="month">Month</option>
-                <option value="allTime" selected>All time</option>
-                <option value="perpDay">Perp day</option>
-                <option value="perpWeek">Perp week</option>
-                <option value="perpMonth">Perp month</option>
-                <option value="perpAllTime">Perp all time</option>
-            </select>
-        </div>
-        <div style="flex: 0 0 auto;">
-            <button id="load" class="btn btn-primary">Load</button>
+    </div>
+
+    <div id="source-csv" class="source-pane" style="display:none;">
+        <div class="controls mt-3" style="flex-direction: column; align-items: stretch;">
+            <div>
+                <label class="form-label">Paste CSV (daily or any frequency)</label>
+                <div class="small text-muted mb-2">
+                    Headers required. Accepted columns: <code>date</code>, <code>account_value</code>, <code>cumulative_pnl</code>.
+                    If you only have <code>daily_pnl</code>, that works too — it'll be cumulated. <code>account_value</code>
+                    can be omitted if you supply <code>nav</code> directly. Delimiter auto-detected (comma or tab).
+                    <br>Example:
+                    <pre class="bg-light p-2 mb-0" style="font-size:0.75rem;">date,account_value,cumulative_pnl
+2023-06-14,1000000,0
+2023-06-15,1001200,1200
+2023-06-16,998900,-1100</pre>
+                </div>
+                <textarea id="csv-input" class="form-control" rows="6" placeholder="Paste CSV here..."></textarea>
+            </div>
+            <div class="mt-2">
+                <button id="load-csv" class="btn btn-primary">Parse & compute</button>
+                <span id="csv-status" class="text-muted ms-3"></span>
+            </div>
         </div>
     </div>
 
@@ -109,13 +139,39 @@
     <div class="chart-container"><canvas id="av-chart"></canvas></div>
 
     <div class="data-panel" id="data-panel" style="display:none;">
-        <div><strong>Data summary</strong> <span class="text-muted">(raw from Hyperliquid, before any math)</span></div>
+        <div><strong>Data summary</strong> <span class="text-muted">(raw input, before any math)</span></div>
         <div id="data-summary" class="mt-2"></div>
         <div class="mt-3"><strong>First 3 + last 3 raw rows</strong> — timestamp / account value / cumulative PnL:</div>
         <div class="table-responsive mt-2">
             <table class="table table-sm table-bordered"><thead><tr>
                 <th>#</th><th>Timestamp</th><th>Date</th><th>Account value (USD)</th><th>Cumulative PnL (USD)</th>
             </tr></thead><tbody id="data-table"></tbody></table>
+        </div>
+    </div>
+
+    <div class="data-panel" id="monthly-panel" style="display:none;">
+        <div><strong>Monthly returns</strong> <span class="text-muted">(computed from whatever data is loaded — coarser buckets = less accurate)</span></div>
+        <div class="table-responsive mt-2">
+            <table class="table table-sm table-bordered text-end" id="monthly-table">
+                <thead><tr>
+                    <th class="text-start">Year</th><th>YTD</th>
+                    <th>Jan</th><th>Feb</th><th>Mar</th><th>Apr</th><th>May</th><th>Jun</th>
+                    <th>Jul</th><th>Aug</th><th>Sep</th><th>Oct</th><th>Nov</th><th>Dec</th>
+                </tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="data-panel" id="followers-panel" style="display:none;">
+        <div><strong>Longest-tenured HLP followers</strong> <span class="text-muted">(candidates whose wallet history you could scrape on-chain)</span></div>
+        <div class="table-responsive mt-2">
+            <table class="table table-sm table-bordered" id="followers-table">
+                <thead><tr>
+                    <th>#</th><th>Wallet</th><th>Days in vault</th><th>Vault equity (USD)</th><th>All-time PnL (USD)</th>
+                </tr></thead>
+                <tbody></tbody>
+            </table>
         </div>
     </div>
 
@@ -402,6 +458,7 @@
             renderMetrics(m);
             renderCharts(series);
             renderDataPanel(rawRows, slice);
+            renderMonthly(series);
             statusEl.textContent = `${vaultName} · ${rawRows.length} raw samples, ${slice.length} in window`;
             sliderStartLabel.textContent = fmtISO(slice[0].t);
             sliderEndLabel.textContent = fmtISO(slice[slice.length - 1].t);
@@ -486,17 +543,134 @@
                 const s = pickSeries(vault, timeframe);
                 const rows = alignSeries(s.accountValueHistory || [], s.pnlHistory || []);
                 if (rows.length < 2) throw new Error('Not enough data points for that timeframe.');
-                rawRows = rows;
-                vaultName = vault.name || 'Vault';
-                windowPanel.style.display = 'block';
-                const minT = rows[0].t;
-                const maxT = rows[rows.length - 1].t;
-                initSlider(minT, maxT);
-                setSliderRange(minT, maxT);
+                installData(rows, vault.name || 'Vault', vault.followers || []);
             } catch (err) {
                 statusEl.textContent = 'Error: ' + err.message;
                 console.error(err);
             }
+        }
+
+        function installData(rows, name, followers) {
+            rawRows = rows;
+            vaultName = name;
+            windowPanel.style.display = 'block';
+            const minT = rows[0].t;
+            const maxT = rows[rows.length - 1].t;
+            initSlider(minT, maxT);
+            setSliderRange(minT, maxT);
+            renderFollowers(followers);
+        }
+
+        function parseCSV(text) {
+            const trimmed = text.trim();
+            if (!trimmed) throw new Error('Empty input.');
+            const delim = trimmed.includes('\t') && !trimmed.split('\n')[0].includes(',') ? '\t' : ',';
+            const lines = trimmed.split(/\r?\n/).filter(l => l.trim());
+            const header = lines[0].split(delim).map(h => h.trim().toLowerCase().replace(/\s+/g, '_'));
+            const idx = name => header.indexOf(name);
+            const iDate = idx('date');
+            const iAV = idx('account_value');
+            const iCumPnl = idx('cumulative_pnl');
+            const iDailyPnl = idx('daily_pnl');
+            const iNav = idx('nav');
+            if (iDate < 0) throw new Error('CSV must have a "date" column.');
+            const out = [];
+            let running = 0;
+            for (let r = 1; r < lines.length; r++) {
+                const cells = lines[r].split(delim);
+                const t = moment(cells[iDate].trim()).valueOf();
+                if (!isFinite(t)) throw new Error(`Bad date on row ${r + 1}: ${cells[iDate]}`);
+                const av = iAV >= 0 ? Number(cells[iAV]) : NaN;
+                let cumPnl;
+                if (iCumPnl >= 0) cumPnl = Number(cells[iCumPnl]);
+                else if (iDailyPnl >= 0) { running += Number(cells[iDailyPnl]); cumPnl = running; }
+                else if (iNav >= 0) {
+                    // Synthesize pnl and av so the same pipeline works: treat NAV as share price with AV=NAV.
+                    const nav = Number(cells[iNav]);
+                    cumPnl = nav - 1;
+                    out.push({ t, accountValue: 1, pnl: cumPnl });
+                    continue;
+                } else throw new Error('CSV needs cumulative_pnl, daily_pnl, or nav column.');
+                out.push({ t, accountValue: isFinite(av) ? av : 1, pnl: cumPnl });
+            }
+            out.sort((a, b) => a.t - b.t);
+            if (out.length < 2) throw new Error('Need at least 2 rows.');
+            return out;
+        }
+
+        function loadCSV() {
+            const raw = document.getElementById('csv-input').value;
+            const statusCsv = document.getElementById('csv-status');
+            try {
+                const rows = parseCSV(raw);
+                statusCsv.textContent = `Parsed ${rows.length} rows.`;
+                installData(rows, 'Pasted CSV', []);
+            } catch (err) {
+                statusCsv.textContent = 'Error: ' + err.message;
+                console.error(err);
+            }
+        }
+
+        function renderMonthly(series) {
+            const panel = document.getElementById('monthly-panel');
+            if (series.length < 2) { panel.style.display = 'none'; return; }
+            panel.style.display = 'block';
+            // Find NAV at the last observation of each month, chain-link within a year for YTD.
+            const byMonth = new Map();
+            for (const p of series) {
+                const m = moment(p.t);
+                const key = m.format('YYYY-MM');
+                byMonth.set(key, p.nav); // keeps the last value per month
+            }
+            // Seed with the starting NAV just before the first observation's month (use first sample).
+            const first = series[0];
+            const firstMonthKey = moment(first.t).format('YYYY-MM');
+            // Build sorted list of months that appear.
+            const months = Array.from(byMonth.keys()).sort();
+            // Month-over-month return uses "NAV at end of prior month" as baseline.
+            // For the first month in the series we use the initial NAV (=1 at window start).
+            const byYear = new Map();
+            let prevNav = first.nav; // at window start
+            let prevKey = null;
+            for (const key of months) {
+                const navEnd = byMonth.get(key);
+                const [y, m] = key.split('-').map(Number);
+                const ret = prevNav > 0 ? navEnd / prevNav - 1 : 0;
+                if (!byYear.has(y)) byYear.set(y, { months: new Array(12).fill(null), ytdStart: prevNav });
+                byYear.get(y).months[m - 1] = ret;
+                // If we crossed a year boundary, reset YTD baseline at new year start (= prevNav when we first hit that year).
+                prevNav = navEnd;
+                prevKey = key;
+            }
+            const tbody = document.querySelector('#monthly-table tbody');
+            const years = Array.from(byYear.keys()).sort((a, b) => b - a);
+            tbody.innerHTML = years.map(y => {
+                const row = byYear.get(y);
+                // YTD: compound only the months that appear in this year.
+                let ytd = 1;
+                let any = false;
+                for (const r of row.months) if (r !== null) { ytd *= 1 + r; any = true; }
+                const ytdCell = any ? fmtPct(ytd - 1) : '—';
+                const cells = row.months.map(r => r === null ? '<td class="text-muted">—</td>'
+                    : `<td class="${r >= 0 ? 'text-success' : 'text-danger'}">${fmtPct(r)}</td>`).join('');
+                return `<tr><th class="text-start">${y}</th><td><strong>${ytdCell}</strong></td>${cells}</tr>`;
+            }).join('');
+        }
+
+        function renderFollowers(followers) {
+            const panel = document.getElementById('followers-panel');
+            if (!followers.length) { panel.style.display = 'none'; return; }
+            panel.style.display = 'block';
+            const sorted = [...followers].sort((a, b) => (b.daysFollowing || 0) - (a.daysFollowing || 0)).slice(0, 10);
+            const tbody = document.querySelector('#followers-table tbody');
+            tbody.innerHTML = sorted.map((f, i) => `
+                <tr>
+                    <td>${i + 1}</td>
+                    <td><code>${f.user}</code></td>
+                    <td>${f.daysFollowing ?? '—'}</td>
+                    <td>$${fmtUSD(Number(f.vaultEquity || 0))}</td>
+                    <td>$${fmtUSD(Number(f.allTimePnl || 0))}</td>
+                </tr>`).join('');
         }
 
         function attachSecondaryToggle() {
@@ -508,10 +682,24 @@
             });
         }
 
+        function attachTabs() {
+            document.querySelectorAll('#source-tabs button').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    document.querySelectorAll('#source-tabs button').forEach(b => b.classList.remove('active'));
+                    btn.classList.add('active');
+                    const src = btn.dataset.source;
+                    document.getElementById('source-api').style.display = src === 'api' ? '' : 'none';
+                    document.getElementById('source-csv').style.display = src === 'csv' ? '' : 'none';
+                });
+            });
+        }
+
         loadBtn.addEventListener('click', load);
+        document.getElementById('load-csv').addEventListener('click', loadCSV);
         attachPresetHandlers();
         attachDateHandlers();
         attachSecondaryToggle();
+        attachTabs();
         load();
     </script>
 </body>
