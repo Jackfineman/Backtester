@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HLP Vault CAGR</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/moment@2.29.1/moment.min.js"></script>
+    <style>
+        body { padding: 20px; }
+        .chart-container { max-width: 1000px; margin: 20px auto; }
+        .metrics { max-width: 1000px; margin: 20px auto; }
+        .metric-card { border: 1px solid #dee2e6; border-radius: 6px; padding: 12px; text-align: center; }
+        .metric-label { font-size: 0.85rem; color: #6c757d; text-transform: uppercase; }
+        .metric-value { font-size: 1.5rem; font-weight: 600; }
+        .controls { max-width: 1000px; margin: 0 auto; display: flex; gap: 12px; flex-wrap: wrap; align-items: end; }
+        .controls > div { flex: 1; min-width: 200px; }
+        .note { max-width: 1000px; margin: 20px auto; font-size: 0.85rem; color: #6c757d; }
+    </style>
+</head>
+<body>
+    <h1 class="text-center">Hyperliquid Vault CAGR Calculator</h1>
+    <p class="text-center text-muted">Time-weighted return, stripping out deposits/withdrawals.</p>
+
+    <div class="controls">
+        <div>
+            <label class="form-label">Vault address</label>
+            <input id="vault-address" class="form-control" value="0xdfc24b077bc1425ad1dea75bcb6f8158e10df303">
+        </div>
+        <div>
+            <label class="form-label">Timeframe</label>
+            <select id="timeframe" class="form-select">
+                <option value="day">Day</option>
+                <option value="week">Week</option>
+                <option value="month">Month</option>
+                <option value="allTime" selected>All time</option>
+                <option value="perpDay">Perp day</option>
+                <option value="perpWeek">Perp week</option>
+                <option value="perpMonth">Perp month</option>
+                <option value="perpAllTime">Perp all time</option>
+            </select>
+        </div>
+        <div style="flex: 0 0 auto;">
+            <button id="load" class="btn btn-primary">Load</button>
+        </div>
+    </div>
+
+    <div id="status" class="text-center text-muted mt-3"></div>
+
+    <div class="metrics">
+        <div class="row g-2" id="metric-row"></div>
+    </div>
+
+    <div class="chart-container"><canvas id="nav-chart"></canvas></div>
+    <div class="chart-container"><canvas id="av-chart"></canvas></div>
+
+    <div class="note">
+        <strong>How this works:</strong> Hyperliquid exposes a cumulative PnL series and an account-value series.
+        Account value moves with both trading PnL <em>and</em> user deposits/withdrawals, so naive
+        (end - start) / start over account value overstates or understates real performance.
+        Instead, for each interval we compute the trading PnL delta <code>(pnl[i] - pnl[i-1])</code>
+        and divide by the account value at the start of that interval to get a clean per-period return.
+        Those returns are chain-linked into a NAV index (starts at 1), and CAGR is
+        <code>NAV_end^(365 / days) - 1</code>. This is the standard time-weighted return method.
+    </div>
+
+    <script>
+        const API_URL = 'https://api.hyperliquid.xyz/info';
+        const loadBtn = document.getElementById('load');
+        const statusEl = document.getElementById('status');
+        const metricRow = document.getElementById('metric-row');
+        let navChart, avChart;
+
+        async function fetchVault(address) {
+            const res = await fetch(API_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ type: 'vaultDetails', vaultAddress: address }),
+            });
+            if (!res.ok) throw new Error(`API error: ${res.status}`);
+            return res.json();
+        }
+
+        function pickSeries(vault, timeframe) {
+            const entry = vault.portfolio?.find(([name]) => name === timeframe);
+            if (!entry) throw new Error(`Timeframe ${timeframe} not found in portfolio`);
+            return entry[1];
+        }
+
+        function alignSeries(accountValueHistory, pnlHistory) {
+            const pnlMap = new Map(pnlHistory.map(([t, v]) => [t, Number(v)]));
+            const rows = [];
+            for (const [t, av] of accountValueHistory) {
+                if (!pnlMap.has(t)) continue;
+                rows.push({ t, accountValue: Number(av), pnl: pnlMap.get(t) });
+            }
+            rows.sort((a, b) => a.t - b.t);
+            return rows;
+        }
+
+        function computeReturns(rows) {
+            const out = [];
+            let nav = 1;
+            out.push({ t: rows[0].t, nav, ret: 0, accountValue: rows[0].accountValue, pnl: rows[0].pnl });
+            for (let i = 1; i < rows.length; i++) {
+                const prev = rows[i - 1];
+                const cur = rows[i];
+                const pnlDelta = cur.pnl - prev.pnl;
+                // Account value at start of period is the capital that "earned" this PnL.
+                // Guard against zero/negative account values.
+                const ret = prev.accountValue > 0 ? pnlDelta / prev.accountValue : 0;
+                nav *= 1 + ret;
+                out.push({ t: cur.t, nav, ret, accountValue: cur.accountValue, pnl: cur.pnl });
+            }
+            return out;
+        }
+
+        function computeMetrics(series) {
+            const first = series[0];
+            const last = series[series.length - 1];
+            const days = (last.t - first.t) / 86400000;
+            const totalReturn = last.nav - 1;
+            const cagr = days > 0 ? Math.pow(last.nav, 365 / days) - 1 : 0;
+
+            // Volatility & Sharpe: annualize based on average sample spacing.
+            const rets = series.slice(1).map(p => p.ret);
+            const mean = rets.reduce((a, b) => a + b, 0) / (rets.length || 1);
+            const variance = rets.reduce((a, b) => a + (b - mean) ** 2, 0) / (rets.length || 1);
+            const stdev = Math.sqrt(variance);
+            const avgSpacingDays = days / (rets.length || 1);
+            const periodsPerYear = avgSpacingDays > 0 ? 365 / avgSpacingDays : 0;
+            const annVol = stdev * Math.sqrt(periodsPerYear);
+            const annMean = mean * periodsPerYear;
+            const sharpe = annVol > 0 ? annMean / annVol : 0;
+
+            // Max drawdown on NAV.
+            let peak = series[0].nav;
+            let maxDD = 0;
+            for (const p of series) {
+                if (p.nav > peak) peak = p.nav;
+                const dd = (p.nav - peak) / peak;
+                if (dd < maxDD) maxDD = dd;
+            }
+
+            return { days, totalReturn, cagr, annVol, sharpe, maxDD, samples: series.length };
+        }
+
+        function fmtPct(x, digits = 2) {
+            return (x * 100).toFixed(digits) + '%';
+        }
+
+        function renderMetrics(m) {
+            const cards = [
+                ['Period', `${m.days.toFixed(1)} days`],
+                ['Total return', fmtPct(m.totalReturn)],
+                ['CAGR', fmtPct(m.cagr)],
+                ['Annualized vol', fmtPct(m.annVol)],
+                ['Sharpe (rf=0)', m.sharpe.toFixed(2)],
+                ['Max drawdown', fmtPct(m.maxDD)],
+            ];
+            metricRow.innerHTML = cards.map(([label, value]) => `
+                <div class="col-6 col-md-4 col-lg-2">
+                    <div class="metric-card">
+                        <div class="metric-label">${label}</div>
+                        <div class="metric-value">${value}</div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function renderCharts(series) {
+            const labels = series.map(p => moment(p.t).format('MMM D YYYY'));
+            if (navChart) navChart.destroy();
+            navChart = new Chart(document.getElementById('nav-chart'), {
+                type: 'line',
+                data: {
+                    labels,
+                    datasets: [{
+                        label: 'NAV (time-weighted, starts at 1.00)',
+                        data: series.map(p => p.nav),
+                        borderColor: 'rgb(13, 110, 253)',
+                        pointRadius: 0,
+                        tension: 0.1,
+                    }],
+                },
+                options: {
+                    scales: { x: { ticks: { autoSkip: true, maxTicksLimit: 12 } } },
+                },
+            });
+            if (avChart) avChart.destroy();
+            avChart = new Chart(document.getElementById('av-chart'), {
+                type: 'line',
+                data: {
+                    labels,
+                    datasets: [{
+                        label: 'Account value (USD, includes deposits/withdrawals)',
+                        data: series.map(p => p.accountValue),
+                        borderColor: 'rgb(108, 117, 125)',
+                        pointRadius: 0,
+                        tension: 0.1,
+                    }],
+                },
+                options: {
+                    scales: { x: { ticks: { autoSkip: true, maxTicksLimit: 12 } } },
+                },
+            });
+        }
+
+        async function load() {
+            const address = document.getElementById('vault-address').value.trim();
+            const timeframe = document.getElementById('timeframe').value;
+            statusEl.textContent = 'Loading...';
+            try {
+                const vault = await fetchVault(address);
+                const s = pickSeries(vault, timeframe);
+                const rows = alignSeries(s.accountValueHistory || [], s.pnlHistory || []);
+                if (rows.length < 2) throw new Error('Not enough data points for that timeframe.');
+                const series = computeReturns(rows);
+                renderMetrics(computeMetrics(series));
+                renderCharts(series);
+                statusEl.textContent = `${vault.name || 'Vault'} · ${rows.length} samples`;
+            } catch (err) {
+                statusEl.textContent = 'Error: ' + err.message;
+                console.error(err);
+            }
+        }
+
+        loadBtn.addEventListener('click', load);
+        load();
+    </script>
+</body>
+</html>
