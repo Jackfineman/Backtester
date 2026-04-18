@@ -5,8 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>HLP Vault CAGR</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/nouislider@15.7.1/dist/nouislider.min.css" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/moment@2.29.1/moment.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/nouislider@15.7.1/dist/nouislider.min.js"></script>
     <style>
         body { padding: 20px; }
         .chart-container { max-width: 1000px; margin: 20px auto; }
@@ -16,7 +18,14 @@
         .metric-value { font-size: 1.5rem; font-weight: 600; }
         .controls { max-width: 1000px; margin: 0 auto; display: flex; gap: 12px; flex-wrap: wrap; align-items: end; }
         .controls > div { flex: 1; min-width: 200px; }
+        .window-panel { max-width: 1000px; margin: 20px auto; padding: 16px; border: 1px solid #dee2e6; border-radius: 8px; }
+        .preset-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
+        .date-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; margin-bottom: 14px; }
+        .date-row > div { flex: 1; min-width: 160px; }
+        .slider-wrap { padding: 20px 8px 4px 8px; }
+        .slider-labels { display: flex; justify-content: space-between; font-size: 0.8rem; color: #6c757d; margin-top: 6px; }
         .note { max-width: 1000px; margin: 20px auto; font-size: 0.85rem; color: #6c757d; }
+        .noUi-connect { background: #0d6efd; }
     </style>
 </head>
 <body>
@@ -29,7 +38,7 @@
             <input id="vault-address" class="form-control" value="0xdfc24b077bc1425ad1dea75bcb6f8158e10df303">
         </div>
         <div>
-            <label class="form-label">Timeframe</label>
+            <label class="form-label">Timeframe (API bucket)</label>
             <select id="timeframe" class="form-select">
                 <option value="day">Day</option>
                 <option value="week">Week</option>
@@ -48,6 +57,34 @@
 
     <div id="status" class="text-center text-muted mt-3"></div>
 
+    <div class="window-panel" id="window-panel" style="display:none;">
+        <div class="preset-row" id="preset-row">
+            <button class="btn btn-sm btn-outline-secondary" data-days="30">1M</button>
+            <button class="btn btn-sm btn-outline-secondary" data-days="90">3M</button>
+            <button class="btn btn-sm btn-outline-secondary" data-days="180">6M</button>
+            <button class="btn btn-sm btn-outline-secondary" data-days="365">1Y</button>
+            <button class="btn btn-sm btn-outline-secondary" data-days="730">2Y</button>
+            <button class="btn btn-sm btn-outline-secondary" data-days="0">All</button>
+        </div>
+        <div class="date-row">
+            <div>
+                <label class="form-label">Start</label>
+                <input type="date" id="start-date" class="form-control">
+            </div>
+            <div>
+                <label class="form-label">End</label>
+                <input type="date" id="end-date" class="form-control">
+            </div>
+        </div>
+        <div class="slider-wrap">
+            <div id="range-slider"></div>
+            <div class="slider-labels">
+                <span id="slider-start"></span>
+                <span id="slider-end"></span>
+            </div>
+        </div>
+    </div>
+
     <div class="metrics">
         <div class="row g-2" id="metric-row"></div>
     </div>
@@ -56,13 +93,21 @@
     <div class="chart-container"><canvas id="av-chart"></canvas></div>
 
     <div class="note">
-        <strong>How this works:</strong> Hyperliquid exposes a cumulative PnL series and an account-value series.
+        <strong>Method:</strong> Hyperliquid exposes cumulative PnL and account-value series per timeframe bucket.
         Account value moves with both trading PnL <em>and</em> user deposits/withdrawals, so naive
-        (end - start) / start over account value overstates or understates real performance.
-        Instead, for each interval we compute the trading PnL delta <code>(pnl[i] - pnl[i-1])</code>
-        and divide by the account value at the start of that interval to get a clean per-period return.
-        Those returns are chain-linked into a NAV index (starts at 1), and CAGR is
-        <code>NAV_end^(365 / days) - 1</code>. This is the standard time-weighted return method.
+        (AV_end − AV_start) / AV_start misstates real performance. For each interval we take
+        <code>Δpnl = pnl[i] − pnl[i-1]</code> (pure trading PnL) and divide by the account value at the
+        start of that interval, giving a clean per-period return. Returns are chain-linked into a NAV index
+        (rebased to 1.0 at the start of the selected window), and CAGR is
+        <code>NAV_end<sup>365/days</sup> − 1</code> over the window. This is standard time-weighted return.
+        <br><br>
+        <strong>Gotchas:</strong> the API ships fixed buckets — <code>day</code>/<code>week</code>/<code>month</code>/<code>allTime</code>
+        — so the sample spacing on "allTime" is coarse (~12 days/bar for HLP). Intra-bar drawdowns get smoothed away,
+        which is why <code>perpAllTime</code> can show near-zero drawdown even when the vault clearly dipped.
+        For tighter resolution on a recent window, pick a shorter bucket (e.g. <code>month</code>) and narrow the range.
+        <br><br>
+        <strong>allTime vs perpAllTime:</strong> HLP runs spot market-making plus the perps liquidation backstop.
+        <code>allTime</code> is the full vault; <code>perpAllTime</code> is only the perps portion.
     </div>
 
     <script>
@@ -70,7 +115,17 @@
         const loadBtn = document.getElementById('load');
         const statusEl = document.getElementById('status');
         const metricRow = document.getElementById('metric-row');
+        const windowPanel = document.getElementById('window-panel');
+        const startDateInput = document.getElementById('start-date');
+        const endDateInput = document.getElementById('end-date');
+        const sliderEl = document.getElementById('range-slider');
+        const sliderStartLabel = document.getElementById('slider-start');
+        const sliderEndLabel = document.getElementById('slider-end');
         let navChart, avChart;
+        let rawRows = [];
+        let vaultName = '';
+        let sliderInitialized = false;
+        let suppressSliderEvents = false;
 
         async function fetchVault(address) {
             const res = await fetch(API_URL, {
@@ -107,8 +162,6 @@
                 const prev = rows[i - 1];
                 const cur = rows[i];
                 const pnlDelta = cur.pnl - prev.pnl;
-                // Account value at start of period is the capital that "earned" this PnL.
-                // Guard against zero/negative account values.
                 const ret = prev.accountValue > 0 ? pnlDelta / prev.accountValue : 0;
                 nav *= 1 + ret;
                 out.push({ t: cur.t, nav, ret, accountValue: cur.accountValue, pnl: cur.pnl });
@@ -123,7 +176,6 @@
             const totalReturn = last.nav - 1;
             const cagr = days > 0 ? Math.pow(last.nav, 365 / days) - 1 : 0;
 
-            // Volatility & Sharpe: annualize based on average sample spacing.
             const rets = series.slice(1).map(p => p.ret);
             const mean = rets.reduce((a, b) => a + b, 0) / (rets.length || 1);
             const variance = rets.reduce((a, b) => a + (b - mean) ** 2, 0) / (rets.length || 1);
@@ -134,7 +186,6 @@
             const annMean = mean * periodsPerYear;
             const sharpe = annVol > 0 ? annMean / annVol : 0;
 
-            // Max drawdown on NAV.
             let peak = series[0].nav;
             let maxDD = 0;
             for (const p of series) {
@@ -143,12 +194,10 @@
                 if (dd < maxDD) maxDD = dd;
             }
 
-            return { days, totalReturn, cagr, annVol, sharpe, maxDD, samples: series.length };
+            return { days, totalReturn, cagr, annVol, sharpe, maxDD, samples: series.length, avgSpacingDays };
         }
 
-        function fmtPct(x, digits = 2) {
-            return (x * 100).toFixed(digits) + '%';
-        }
+        function fmtPct(x, digits = 2) { return (x * 100).toFixed(digits) + '%'; }
 
         function renderMetrics(m) {
             const cards = [
@@ -158,9 +207,11 @@
                 ['Annualized vol', fmtPct(m.annVol)],
                 ['Sharpe (rf=0)', m.sharpe.toFixed(2)],
                 ['Max drawdown', fmtPct(m.maxDD)],
+                ['Samples', `${m.samples}`],
+                ['Avg bar', `${m.avgSpacingDays.toFixed(2)}d`],
             ];
             metricRow.innerHTML = cards.map(([label, value]) => `
-                <div class="col-6 col-md-4 col-lg-2">
+                <div class="col-6 col-md-3 col-lg-3">
                     <div class="metric-card">
                         <div class="metric-label">${label}</div>
                         <div class="metric-value">${value}</div>
@@ -174,37 +225,113 @@
             if (navChart) navChart.destroy();
             navChart = new Chart(document.getElementById('nav-chart'), {
                 type: 'line',
-                data: {
-                    labels,
-                    datasets: [{
-                        label: 'NAV (time-weighted, starts at 1.00)',
-                        data: series.map(p => p.nav),
-                        borderColor: 'rgb(13, 110, 253)',
-                        pointRadius: 0,
-                        tension: 0.1,
-                    }],
-                },
-                options: {
-                    scales: { x: { ticks: { autoSkip: true, maxTicksLimit: 12 } } },
-                },
+                data: { labels, datasets: [{
+                    label: 'NAV (time-weighted, rebased to 1.00 at window start)',
+                    data: series.map(p => p.nav),
+                    borderColor: 'rgb(13, 110, 253)', pointRadius: 0, tension: 0.1,
+                }] },
+                options: { scales: { x: { ticks: { autoSkip: true, maxTicksLimit: 12 } } } },
             });
             if (avChart) avChart.destroy();
             avChart = new Chart(document.getElementById('av-chart'), {
                 type: 'line',
-                data: {
-                    labels,
-                    datasets: [{
-                        label: 'Account value (USD, includes deposits/withdrawals)',
-                        data: series.map(p => p.accountValue),
-                        borderColor: 'rgb(108, 117, 125)',
-                        pointRadius: 0,
-                        tension: 0.1,
-                    }],
-                },
-                options: {
-                    scales: { x: { ticks: { autoSkip: true, maxTicksLimit: 12 } } },
-                },
+                data: { labels, datasets: [{
+                    label: 'Account value USD (includes deposits/withdrawals)',
+                    data: series.map(p => p.accountValue),
+                    borderColor: 'rgb(108, 117, 125)', pointRadius: 0, tension: 0.1,
+                }] },
+                options: { scales: { x: { ticks: { autoSkip: true, maxTicksLimit: 12 } } } },
             });
+        }
+
+        function fmtISO(t) { return moment(t).format('YYYY-MM-DD'); }
+
+        function refreshWindow(startT, endT) {
+            const slice = rawRows.filter(r => r.t >= startT && r.t <= endT);
+            if (slice.length < 2) {
+                statusEl.textContent = `${vaultName} · window too narrow (need ≥2 samples; got ${slice.length}). Try a wider range or a coarser timeframe.`;
+                metricRow.innerHTML = '';
+                if (navChart) { navChart.destroy(); navChart = null; }
+                if (avChart) { avChart.destroy(); avChart = null; }
+                return;
+            }
+            const series = computeReturns(slice);
+            const m = computeMetrics(series);
+            renderMetrics(m);
+            renderCharts(series);
+            statusEl.textContent = `${vaultName} · ${rawRows.length} raw samples, ${slice.length} in window`;
+            sliderStartLabel.textContent = fmtISO(slice[0].t);
+            sliderEndLabel.textContent = fmtISO(slice[slice.length - 1].t);
+        }
+
+        function setSliderRange(startT, endT) {
+            suppressSliderEvents = true;
+            sliderEl.noUiSlider.set([startT, endT]);
+            suppressSliderEvents = false;
+            startDateInput.value = fmtISO(startT);
+            endDateInput.value = fmtISO(endT);
+            refreshWindow(startT, endT);
+        }
+
+        function initSlider(minT, maxT) {
+            if (sliderInitialized) {
+                sliderEl.noUiSlider.updateOptions({
+                    range: { min: minT, max: maxT },
+                    start: [minT, maxT],
+                }, true);
+            } else {
+                noUiSlider.create(sliderEl, {
+                    start: [minT, maxT],
+                    connect: true,
+                    range: { min: minT, max: maxT },
+                    step: 86400000,
+                });
+                sliderEl.noUiSlider.on('update', (vals) => {
+                    if (suppressSliderEvents) return;
+                    const [s, e] = vals.map(v => Math.round(Number(v)));
+                    startDateInput.value = fmtISO(s);
+                    endDateInput.value = fmtISO(e);
+                });
+                sliderEl.noUiSlider.on('change', (vals) => {
+                    const [s, e] = vals.map(v => Math.round(Number(v)));
+                    refreshWindow(s, e);
+                });
+                sliderInitialized = true;
+            }
+            startDateInput.min = fmtISO(minT);
+            startDateInput.max = fmtISO(maxT);
+            endDateInput.min = fmtISO(minT);
+            endDateInput.max = fmtISO(maxT);
+        }
+
+        function attachPresetHandlers() {
+            document.querySelectorAll('#preset-row button').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const days = Number(btn.dataset.days);
+                    const maxT = rawRows[rawRows.length - 1].t;
+                    const minT = rawRows[0].t;
+                    const startT = days === 0 ? minT : Math.max(minT, maxT - days * 86400000);
+                    setSliderRange(startT, maxT);
+                });
+            });
+        }
+
+        function attachDateHandlers() {
+            const apply = () => {
+                const sRaw = startDateInput.value;
+                const eRaw = endDateInput.value;
+                if (!sRaw || !eRaw) return;
+                let s = moment(sRaw).valueOf();
+                let e = moment(eRaw).endOf('day').valueOf();
+                const minT = rawRows[0].t;
+                const maxT = rawRows[rawRows.length - 1].t;
+                s = Math.max(minT, Math.min(s, maxT));
+                e = Math.max(minT, Math.min(e, maxT));
+                if (e <= s) return;
+                setSliderRange(s, e);
+            };
+            startDateInput.addEventListener('change', apply);
+            endDateInput.addEventListener('change', apply);
         }
 
         async function load() {
@@ -216,10 +343,13 @@
                 const s = pickSeries(vault, timeframe);
                 const rows = alignSeries(s.accountValueHistory || [], s.pnlHistory || []);
                 if (rows.length < 2) throw new Error('Not enough data points for that timeframe.');
-                const series = computeReturns(rows);
-                renderMetrics(computeMetrics(series));
-                renderCharts(series);
-                statusEl.textContent = `${vault.name || 'Vault'} · ${rows.length} samples`;
+                rawRows = rows;
+                vaultName = vault.name || 'Vault';
+                windowPanel.style.display = 'block';
+                const minT = rows[0].t;
+                const maxT = rows[rows.length - 1].t;
+                initSlider(minT, maxT);
+                setSliderRange(minT, maxT);
             } catch (err) {
                 statusEl.textContent = 'Error: ' + err.message;
                 console.error(err);
@@ -227,6 +357,8 @@
         }
 
         loadBtn.addEventListener('click', load);
+        attachPresetHandlers();
+        attachDateHandlers();
         load();
     </script>
 </body>
