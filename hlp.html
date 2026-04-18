@@ -26,6 +26,9 @@
         .slider-labels { display: flex; justify-content: space-between; font-size: 0.8rem; color: #6c757d; margin-top: 6px; }
         .note { max-width: 1000px; margin: 20px auto; font-size: 0.85rem; color: #6c757d; }
         .noUi-connect { background: #0d6efd; }
+        .data-panel { max-width: 1000px; margin: 20px auto; padding: 14px; background: #f8f9fa; border-radius: 8px; font-size: 0.88rem; }
+        .data-panel table { font-size: 0.82rem; margin-bottom: 0; }
+        .chart-toggle { max-width: 1000px; margin: 10px auto; text-align: center; }
     </style>
 </head>
 <body>
@@ -90,7 +93,31 @@
     </div>
 
     <div class="chart-container"><canvas id="nav-chart"></canvas></div>
+
+    <div class="chart-toggle">
+        <div class="btn-group btn-group-sm" role="group" id="secondary-toggle">
+            <input type="radio" class="btn-check" name="secondary" id="sec-av" value="accountValue" checked>
+            <label class="btn btn-outline-secondary" for="sec-av">Account value (USD)</label>
+            <input type="radio" class="btn-check" name="secondary" id="sec-pnl" value="pnl">
+            <label class="btn btn-outline-secondary" for="sec-pnl">Cumulative PnL (USD)</label>
+            <input type="radio" class="btn-check" name="secondary" id="sec-dpnl" value="pnlDelta">
+            <label class="btn btn-outline-secondary" for="sec-dpnl">Per-bar ΔPnL (USD)</label>
+            <input type="radio" class="btn-check" name="secondary" id="sec-ret" value="retPct">
+            <label class="btn btn-outline-secondary" for="sec-ret">Per-bar return (%)</label>
+        </div>
+    </div>
     <div class="chart-container"><canvas id="av-chart"></canvas></div>
+
+    <div class="data-panel" id="data-panel" style="display:none;">
+        <div><strong>Data summary</strong> <span class="text-muted">(raw from Hyperliquid, before any math)</span></div>
+        <div id="data-summary" class="mt-2"></div>
+        <div class="mt-3"><strong>First 3 + last 3 raw rows</strong> — timestamp / account value / cumulative PnL:</div>
+        <div class="table-responsive mt-2">
+            <table class="table table-sm table-bordered"><thead><tr>
+                <th>#</th><th>Timestamp</th><th>Date</th><th>Account value (USD)</th><th>Cumulative PnL (USD)</th>
+            </tr></thead><tbody id="data-table"></tbody></table>
+        </div>
+    </div>
 
     <div class="note">
         <strong>Method:</strong> Hyperliquid exposes cumulative PnL and account-value series per timeframe bucket.
@@ -126,6 +153,8 @@
         let vaultName = '';
         let sliderInitialized = false;
         let suppressSliderEvents = false;
+        let currentSeries = [];
+        let secondaryMode = 'accountValue';
 
         async function fetchVault(address) {
             const res = await fetch(API_URL, {
@@ -157,14 +186,18 @@
         function computeReturns(rows) {
             const out = [];
             let nav = 1;
-            out.push({ t: rows[0].t, nav, ret: 0, accountValue: rows[0].accountValue, pnl: rows[0].pnl });
+            // Rebase cumulative PnL so window starts at 0 (easier to read on the chart).
+            const pnlBase = rows[0].pnl;
+            out.push({ t: rows[0].t, nav, ret: 0, pnlDelta: 0,
+                accountValue: rows[0].accountValue, pnl: rows[0].pnl - pnlBase });
             for (let i = 1; i < rows.length; i++) {
                 const prev = rows[i - 1];
                 const cur = rows[i];
                 const pnlDelta = cur.pnl - prev.pnl;
                 const ret = prev.accountValue > 0 ? pnlDelta / prev.accountValue : 0;
                 nav *= 1 + ret;
-                out.push({ t: cur.t, nav, ret, accountValue: cur.accountValue, pnl: cur.pnl });
+                out.push({ t: cur.t, nav, ret, pnlDelta,
+                    accountValue: cur.accountValue, pnl: cur.pnl - pnlBase });
             }
             return out;
         }
@@ -220,7 +253,74 @@
             `).join('');
         }
 
+        function fmtUSD(x) {
+            const abs = Math.abs(x);
+            if (abs >= 1e9) return (x / 1e9).toFixed(2) + 'B';
+            if (abs >= 1e6) return (x / 1e6).toFixed(2) + 'M';
+            if (abs >= 1e3) return (x / 1e3).toFixed(2) + 'K';
+            return x.toFixed(2);
+        }
+
+        function commonOptions(valueFmt) {
+            return {
+                interaction: { mode: 'index', intersect: false },
+                plugins: {
+                    tooltip: {
+                        callbacks: {
+                            title: (items) => {
+                                const i = items[0].dataIndex;
+                                return moment(currentSeries[i].t).format('ddd MMM D YYYY HH:mm');
+                            },
+                            label: (ctx) => `${ctx.dataset.label}: ${valueFmt(ctx.parsed.y)}`,
+                            afterLabel: (ctx) => {
+                                const i = ctx.dataIndex;
+                                const p = currentSeries[i];
+                                const lines = [];
+                                lines.push('NAV: ' + p.nav.toFixed(6));
+                                lines.push('Account value: $' + fmtUSD(p.accountValue));
+                                lines.push('Cumulative ΔPnL (window): $' + fmtUSD(p.pnl));
+                                lines.push('Per-bar ΔPnL: $' + fmtUSD(p.pnlDelta));
+                                lines.push('Per-bar return: ' + (p.ret * 100).toFixed(4) + '%');
+                                return lines;
+                            },
+                        },
+                    },
+                },
+                scales: { x: { ticks: { autoSkip: true, maxTicksLimit: 12 } } },
+            };
+        }
+
+        function secondarySpec(mode) {
+            switch (mode) {
+                case 'accountValue': return {
+                    label: 'Account value (USD) — raw, includes deposits/withdrawals',
+                    color: 'rgb(108, 117, 125)',
+                    data: s => s.map(p => p.accountValue),
+                    fmt: v => '$' + fmtUSD(v),
+                };
+                case 'pnl': return {
+                    label: 'Cumulative trading PnL in window (USD)',
+                    color: 'rgb(25, 135, 84)',
+                    data: s => s.map(p => p.pnl),
+                    fmt: v => '$' + fmtUSD(v),
+                };
+                case 'pnlDelta': return {
+                    label: 'Per-bar ΔPnL (USD) — trading PnL earned that bar',
+                    color: 'rgb(220, 53, 69)',
+                    data: s => s.map(p => p.pnlDelta),
+                    fmt: v => '$' + fmtUSD(v),
+                };
+                case 'retPct': return {
+                    label: 'Per-bar return (%) — ΔPnL / account value at bar start',
+                    color: 'rgb(255, 193, 7)',
+                    data: s => s.map(p => p.ret * 100),
+                    fmt: v => v.toFixed(4) + '%',
+                };
+            }
+        }
+
         function renderCharts(series) {
+            currentSeries = series;
             const labels = series.map(p => moment(p.t).format('MMM D YYYY'));
             if (navChart) navChart.destroy();
             navChart = new Chart(document.getElementById('nav-chart'), {
@@ -230,18 +330,60 @@
                     data: series.map(p => p.nav),
                     borderColor: 'rgb(13, 110, 253)', pointRadius: 0, tension: 0.1,
                 }] },
-                options: { scales: { x: { ticks: { autoSkip: true, maxTicksLimit: 12 } } } },
+                options: commonOptions(v => v.toFixed(6)),
             });
+            renderSecondary();
+        }
+
+        function renderSecondary() {
+            if (!currentSeries.length) return;
+            const labels = currentSeries.map(p => moment(p.t).format('MMM D YYYY'));
+            const spec = secondarySpec(secondaryMode);
             if (avChart) avChart.destroy();
             avChart = new Chart(document.getElementById('av-chart'), {
                 type: 'line',
                 data: { labels, datasets: [{
-                    label: 'Account value USD (includes deposits/withdrawals)',
-                    data: series.map(p => p.accountValue),
-                    borderColor: 'rgb(108, 117, 125)', pointRadius: 0, tension: 0.1,
+                    label: spec.label,
+                    data: spec.data(currentSeries),
+                    borderColor: spec.color, pointRadius: 0, tension: 0.1,
                 }] },
-                options: { scales: { x: { ticks: { autoSkip: true, maxTicksLimit: 12 } } } },
+                options: commonOptions(spec.fmt),
             });
+        }
+
+        function renderDataPanel(allRows, sliceRows) {
+            const panel = document.getElementById('data-panel');
+            panel.style.display = 'block';
+            const gaps = [];
+            for (let i = 1; i < allRows.length; i++) gaps.push(allRows[i].t - allRows[i-1].t);
+            gaps.sort((a, b) => a - b);
+            const median = gaps.length ? gaps[Math.floor(gaps.length / 2)] : 0;
+            const minGap = gaps.length ? gaps[0] : 0;
+            const maxGap = gaps.length ? gaps[gaps.length - 1] : 0;
+            const msToH = ms => (ms / 3600000).toFixed(2) + 'h';
+            const msToD = ms => (ms / 86400000).toFixed(2) + 'd';
+            document.getElementById('data-summary').innerHTML = `
+                <div>Vault: <code>${vaultName}</code></div>
+                <div>Full range in this bucket: <code>${fmtISO(allRows[0].t)} → ${fmtISO(allRows.at(-1).t)}</code>
+                (${((allRows.at(-1).t - allRows[0].t) / 86400000).toFixed(1)} days)</div>
+                <div>Raw samples returned by API: <code>${allRows.length}</code></div>
+                <div>Bar spacing — median: <code>${msToH(median)} / ${msToD(median)}</code>,
+                min: <code>${msToH(minGap)}</code>, max: <code>${msToH(maxGap)}</code></div>
+                <div>In selected window: <code>${sliceRows.length}</code> samples covering
+                <code>${fmtISO(sliceRows[0].t)} → ${fmtISO(sliceRows.at(-1).t)}</code></div>
+            `;
+            const pick = [...allRows.slice(0, 3), ...allRows.slice(-3)];
+            const tbody = document.getElementById('data-table');
+            tbody.innerHTML = pick.map((r, i) => {
+                const idx = i < 3 ? i : allRows.length - (6 - i);
+                return `<tr>
+                    <td>${idx}</td>
+                    <td><code>${r.t}</code></td>
+                    <td>${moment(r.t).format('YYYY-MM-DD HH:mm')}</td>
+                    <td>$${fmtUSD(r.accountValue)}</td>
+                    <td>$${fmtUSD(r.pnl)}</td>
+                </tr>`;
+            }).join('');
         }
 
         function fmtISO(t) { return moment(t).format('YYYY-MM-DD'); }
@@ -259,6 +401,7 @@
             const m = computeMetrics(series);
             renderMetrics(m);
             renderCharts(series);
+            renderDataPanel(rawRows, slice);
             statusEl.textContent = `${vaultName} · ${rawRows.length} raw samples, ${slice.length} in window`;
             sliderStartLabel.textContent = fmtISO(slice[0].t);
             sliderEndLabel.textContent = fmtISO(slice[slice.length - 1].t);
@@ -356,9 +499,19 @@
             }
         }
 
+        function attachSecondaryToggle() {
+            document.querySelectorAll('input[name="secondary"]').forEach(r => {
+                r.addEventListener('change', (e) => {
+                    secondaryMode = e.target.value;
+                    renderSecondary();
+                });
+            });
+        }
+
         loadBtn.addEventListener('click', load);
         attachPresetHandlers();
         attachDateHandlers();
+        attachSecondaryToggle();
         load();
     </script>
 </body>
